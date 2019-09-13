@@ -1,0 +1,179 @@
+<?php
+
+/*
+ * @ Módulo PagSeguro com Retorno Automático v0.2
+ * @ Módulo desenvolvido por: Carlo Schneider
+ * @ http://whmcs.hostsul.com/
+ * @ comercial @ hostsul . com
+ */
+
+ob_start();
+
+/*
+ * Inclui o arquivo de configuração do WHMCS
+ * Respeite a ordem das pastas, caso contrário o sistema não irá incluir o arquivo de configuração do WHMCS.
+ */
+include("../../../configuration.php");
+
+/*
+ * Formata data
+ */
+function data($var){
+	return date('d/m/Y H:i:s', strtotime($var));
+}
+
+/*
+ * Faz a conexão com o banco de dados
+ */
+mysql_select_db($db_name, mysql_connect($db_host, $db_username, $db_password)) or print (mysql_error());
+
+/*
+ * Pega o token do banco de dados
+ */
+$token = mysql_fetch_assoc(mysql_query("SELECT value FROM tblpaymentgateways WHERE gateway = 'pagseguro' AND setting = 'token'"));
+define('TOKEN', $token[value]);
+
+/*
+ * Inclui o arquivo da biblioteca desenvolvida pela Visie.com.br (http://visie.com.br/pagseguro/)
+ */
+include("class.ps.php");
+
+/*
+ * Função que captura os dados enviados pelo PagSeguro
+ */
+function retorno_automatico ($VendedorEmail, $TransacaoID, $Referencia, $TipoFrete, $ValorFrete, $Anotacao, $DataTransacao, $TipoPagamento, $StatusTransacao, $CliNome, $CliEmail, $CliEndereco, $CliNumero, $CliComplemento, $CliBairro, $CliCidade, $CliEstado, $CliCEP, $CliTelefone, $produtos, $NumItens) {
+
+	/*
+	 * Função que mostra o status
+	 */
+	function status($string, $status, $data, $tipo, $id){
+		$patterns[0] = '/%status%/';
+		$patterns[1] = '/%data%/';
+		$patterns[2] = '/%tipopagamento%/';
+		$patterns[3] = '/%transid%/';
+		$replacements[3] = $status;
+		$replacements[2] = $data;
+		$replacements[1] = $tipo;
+		$replacements[0] = $id;
+		return preg_replace($patterns, $replacements, $string);
+	}
+
+	/*
+	 * Pega do banco de dados o campo status que é preenchido nas configurações.
+	 * Em seguida faz a substituição das variaveis %status%, %data%, %tipopagamento%, %transid% pelos seus respectivos valores.
+	 */
+	$status = mysql_fetch_assoc(mysql_query("SELECT value FROM tblpaymentgateways WHERE gateway='pagseguro' AND setting='status'"));
+	if(empty($status)){ $status = '%status%'; }
+
+	$function_status = status($status[value], $StatusTransacao, $DataTransacao, $TipoPagamento, $TransacaoID);
+
+	/*
+	 * Verifica se o e-mail da sua conta PagSeguro está correto.
+	 */
+	$verificar_email = mysql_query("SELECT * FROM tblpaymentgateways WHERE gateway = 'pagseguro' AND setting = 'conta' AND value = '$VendedorEmail'") or die (mysql_error());
+	if(mysql_num_rows($verificar_email) == 1){
+
+		if($StatusTransacao == "Completo"){  }
+		if($StatusTransacao == "Cancelado"){  }
+
+		/*
+		 * Pagamentos em análise. Normalmente quando são feitos via Cartão de Crédito.
+		 */
+		if($StatusTransacao == "Em Análise"){
+	
+			/*
+			 * Pega o ID do cliente do banco de dados de acordo o número da fatura enviada pelo PagSeguro.
+			 * Em seguida insere no banco de dados o status de que o pagamento está em análise.
+			 */
+			$id_cliente = mysql_fetch_assoc(mysql_query("SELECT userid FROM tblinvoices WHERE id='$Referencia'") or die (mysql_error()));
+			mysql_query("INSERT INTO tblaccounts (userid, gateway, date, description, amountin, fees, amountout, transid, invoiceid) VALUES ('$id_cliente[userid]', 'pagseguro', '".data($DataTransacao)."', 'Invoice Payment', '0.00', '0.00', '0.00', '$function_status', '$Referencia')") or die (mysql_error());
+	
+		}
+
+		/*
+		 * Pagamento aprovado. O cliente efetuou o pagamento e o PagSeguro o recebeu.
+		 */
+		if($StatusTransacao == "Aprovado"){
+
+			// Rodar API do WHMCS
+			/* Pega o valor real do serviço através do Invoice ID. */
+			$verificar_status = mysql_query("SELECT * FROM tblinvoices WHERE id='$Referencia' AND status='Paid'") or die (mysql_error());
+			if(mysql_num_rows($verificar_status) < 1){
+	
+				$url = mysql_fetch_assoc(mysql_query("SELECT value FROM tblconfiguration WHERE setting='SystemURL'"));
+				$url = $url[value]."includes/api.php"; // Endereço do arquivo api.php do seu WHMCS
+
+				// Pegamos o e-mail da conta PagSeguro.
+				$login = mysql_fetch_assoc(mysql_query("SELECT value FROM tblpaymentgateways WHERE gateway='pagseguro' AND setting='login'"));
+
+				// Pegamos a senha do seu username do WHMCS já em md5 para conectarmos no API.
+				$senha = mysql_fetch_assoc(mysql_query("SELECT password FROM tbladmins WHERE username='".$login[value]."'"));
+
+				// Pegamos o ID do cliente.
+				$id_cliente = mysql_fetch_assoc(mysql_query("SELECT userid FROM tblinvoices WHERE id='$Referencia'"));
+
+				// Pega o valor real do serviço através do Invoice ID.
+				$valor = mysql_fetch_assoc(mysql_query("SELECT total FROM tblinvoices WHERE id='$Referencia'"));
+
+				$postfields["username"] = $login[value];
+				$postfields["password"] = $senha[password];
+				$postfields["action"] = "addinvoicepayment";
+				$postfields["clientid"] = $id_cliente[userid];
+
+				/* Código para adicionar o pagamento ao WHMCS */
+				$postfields["invoiceid"] = $Referencia;
+				$postfields["transid"] = $function_status;
+				$postfields["amount"] = $valor[total];
+				$postfields["fees"] = '0.00';
+				$postfields["gateway"] = 'pagseguro';
+				$postfields["noemail"] = 'false';
+				//$postfields["date"] = data($DataTransacao);
+
+				$ch = curl_init();
+				curl_setopt($ch, CURLOPT_URL, $url);
+				curl_setopt($ch, CURLOPT_POST, 1);
+				curl_setopt($ch, CURLOPT_TIMEOUT, 100);
+				curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+				curl_setopt($ch, CURLOPT_POSTFIELDS, $postfields);
+				$data = curl_exec($ch);
+				curl_close($ch);
+
+				$data = explode(";",$data);
+				foreach ($data AS $temp) {
+					$temp = explode("=",$temp);
+					$results[$temp[0]] = $temp[1];
+				}
+
+				if ($results["result"]=="success") {
+					// Sucess
+				} else {
+					# An error occured
+					echo "The following error occured: ".$results["message"];
+				}
+
+			}
+
+		}
+		if($StatusTransacao == "Aguardando Pagto"){
+			// Pega o id do cliente
+			$id_cliente = mysql_fetch_assoc(mysql_query("SELECT userid FROM tblinvoices WHERE id='$Referencia'"));
+			mysql_query("INSERT INTO tblaccounts (userid, gateway, date, description, amountin, fees, amountout, transid, invoiceid) VALUES ('$id_cliente[userid]', 'pagseguro', '".data($DataTransacao)."', 'Invoice Payment', '0.00', '0.00', '0.00', '$function_status', '$Referencia')") or die (mysql_error());
+		}
+
+	} else {
+
+		// Vai enviar o erro para o error_log.
+		error_log('Erro na verificação de e-mail.', 0);
+
+	}
+
+}
+
+/*
+ * Pega a página de confirmação do banco de dados que será redirecionada
+ */
+$paginaConfirmacao = mysql_fetch_assoc(mysql_query("SELECT value FROM tblpaymentgateways WHERE gateway = 'pagseguro' AND setting = 'link_conf'"));
+header("Location: $paginaConfirmacao[value]");
+ob_end_flush();
+
+?>
